@@ -450,6 +450,52 @@ def history():
         """)).mappings().all()
     return {"items": list(rows)}
 
+@app.post("/history/{history_id}/retry")
+async def retry_history_import(history_id: int):
+    with engine.begin() as cx:
+        row = cx.execute(text("""
+            SELECT id, title, author, torrent_hash, torrent_status, media_type
+            FROM history
+            WHERE id = :id
+        """), {"id": history_id}).mappings().first()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="History row not found")
+    if row.get("torrent_status") != "import_failed":
+        raise HTTPException(status_code=400, detail="Only failed imports can be retried")
+
+    torrent_hash = (row.get("torrent_hash") or "").strip()
+    author = (row.get("author") or "").strip()
+    title = (row.get("title") or "").strip()
+    if not torrent_hash:
+        mark_history_failed(history_id, "", "History row is missing torrent hash.")
+        raise HTTPException(status_code=400, detail="History row is missing torrent hash.")
+    if not author or not title:
+        mark_history_failed(history_id, torrent_hash, "History row is missing author/title.")
+        raise HTTPException(status_code=400, detail="History row is missing author/title.")
+
+    try:
+        media_type = normalize_media_type(row.get("media_type"))
+    except HTTPException as exc:
+        mark_history_failed(history_id, torrent_hash, str(exc.detail))
+        raise
+
+    update_history_status(history_id, "importing")
+
+    try:
+        await import_torrent_to_library(author, title, torrent_hash, media_type)
+    except HTTPException as exc:
+        mark_history_failed(history_id, torrent_hash, str(exc.detail))
+        raise
+    except Exception as exc:
+        logger.exception("Retry import failed for history row %s", history_id)
+        detail = f"Import failed: {exc}"
+        mark_history_failed(history_id, torrent_hash, detail)
+        raise HTTPException(status_code=500, detail=detail)
+
+    mark_history_imported(history_id, torrent_hash)
+    return {"ok": True}
+
 # ---------------------------- List Importable ----------------------------
 async def list_completed_torrents() -> list[dict]:
     async with httpx.AsyncClient(timeout=30) as c:
