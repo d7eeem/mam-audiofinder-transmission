@@ -7,12 +7,13 @@ services:
       - "8080:8080"
     environment:
       MAM_COOKIE: ""
-      TRANSMISSION_URL: "localhost:9091/transmission/rpc
+      TRANSMISSION_URL: "http://transmission:9091/transmission/rpc"
       TRANSMISSION_USER: ""
       TRANSMISSION_PASS: ""
     volumes:
       - /path/to/appdata-for-db:/data
-      - /path/to/transmission-downloads:/downloads
-      - /path/to/audiobook-library:/library
+      # Use one shared media root so audiobook imports can hardlink from /downloads to /library.
+      # Expected subdirectories: downloads, audiobooks.
+      - /path/to/audiobook-media-root:/storage
       - /path/to/ebook-library:/ebooks
     restart: unless-stopped
