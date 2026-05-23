@@ -1,6 +1,6 @@
 # MAM Book Finder
 
-Lightweight web app and API for searching MyAnonamouse, sending downloads to Transmission, and hardlinking completed books into audiobook and ebook libraries.
+Lightweight web app and API for searching MyAnonamouse, sending downloads to Transmission, and importing completed books into audiobook and ebook libraries.
 
 ## Screenshots
 
@@ -13,21 +13,23 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 - Search MAM for audiobooks and ebooks
 - Add torrents to Transmission with a dedicated label
 - Track download history
-- Auto-import completed downloads into `/library` or `/ebooks` using hardlinks
+- Auto-import completed audiobooks into `/library` using hardlinks
+- Auto-import completed ebooks into `/ebooks` using copies
 
 ## Requirements
 
 - Docker and Docker Compose
 - Transmission with RPC enabled
 - A valid MAM session cookie
-- Mounted host paths for `/data` and one shared media root containing downloads and libraries
+- Mounted host paths for `/data`, one shared audiobook media root, and an ebook library
 
 ## Quick Start
 
 1. Set your MAM and Transmission settings in `docker-compose.yml`.
 2. Mount your host storage to the in-container paths:
    - `/data` for the SQLite database
-   - `/storage` for a shared media root with `downloads`, `audiobooks`, and `ebooks` subdirectories
+   - `/storage` for a shared audiobook media root with `downloads` and `audiobooks` subdirectories
+   - `/ebooks` for ebooks
 3. Start the app:
 
    ```bash
@@ -36,9 +38,9 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 
 4. Open the UI at `http://localhost:8080`.
 
-The app exposes `/downloads`, `/library`, and `/ebooks` as symlinks into `/storage/downloads`, `/storage/audiobooks`, and `/storage/ebooks`. This keeps the app paths stable while allowing hardlinks to work.
+The app exposes `/downloads` and `/library` as symlinks into `/storage/downloads` and `/storage/audiobooks`. This keeps the app paths stable while allowing audiobook hardlinks to work.
 
-If you use Transmission in Docker, mount the same host media root or downloads subdirectory there so completed paths still resolve under `/downloads`. Downloads and library folders must live on the same filesystem; otherwise imports fail and the History table shows `Failure` with the hardlink error.
+If you use Transmission in Docker, mount the same host media root or downloads subdirectory there so completed paths still resolve under `/downloads`. Downloads and the audiobook library must live on the same filesystem; otherwise audiobook imports fail and the History table shows `Failure` with the hardlink error. Ebook imports continue to copy into `/ebooks`.
 
 ## Configuration
 

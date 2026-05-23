@@ -12,7 +12,8 @@ services:
       TRANSMISSION_PASS: ""
     volumes:
       - /path/to/appdata-for-db:/data
-      # Use one shared media root so /downloads, /library, and /ebooks can hardlink.
-      # Expected subdirectories: downloads, audiobooks, ebooks.
-      - /path/to/media-root:/storage
+      # Use one shared media root so audiobook imports can hardlink from /downloads to /library.
+      # Expected subdirectories: downloads, audiobooks.
+      - /path/to/audiobook-media-root:/storage
+      - /path/to/ebook-library:/ebooks
     restart: unless-stopped
