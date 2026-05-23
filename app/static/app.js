@@ -204,6 +204,25 @@ function renderHistoryStatusCell(item) {
   return `${statusHtml}${detailHtml}`;
 }
 
+function buildRetryButton(item) {
+  if (item?.torrent_status !== 'import_failed') return null;
+
+  const retryBtn = document.createElement('button');
+  retryBtn.type = 'button';
+  retryBtn.textContent = 'Retry';
+  retryBtn.addEventListener('click', async () => {
+    retryBtn.disabled = true;
+    retryBtn.textContent = 'Retrying...';
+    try {
+      await fetchJson(`/history/${encodeURIComponent(item.id)}/retry`, { method: 'POST' });
+    } catch (e) {
+      console.error('retry failed', e);
+    }
+    await loadHistory();
+  });
+  return retryBtn;
+}
+
 function formatSize(sz) {
   if (sz == null || sz === '') return '';
   const n = Number(sz);
@@ -272,8 +291,11 @@ async function loadHistory() {
         <td class="center">${linkURL ? `<a href="${linkURL}" target="_blank" rel="noopener noreferrer" title="Open on MAM">🔗</a>` : ''}</td>
         <td>${escapeHtml(when)}</td>
         <td>${renderHistoryStatusCell(item)}</td>
+        <td></td>
       `;
 
+      const retryBtn = buildRetryButton(item);
+      if (retryBtn) tr.lastElementChild.appendChild(retryBtn);
       applyDataLabels(historyTable, tr);
       historyBody.appendChild(tr);
     });

@@ -57,6 +57,7 @@ Runtime config comes from environment variables in `docker-compose.yml`.
 ## Notes
 
 - Search, add, and history are available from the main UI.
+- Failed imports show `Failure` in history and can be retried with the row's `Retry` button after fixing the underlying path, mount, or permission issue.
 - The app has no authentication, so do not expose it directly to the public internet.
 
 ## License
