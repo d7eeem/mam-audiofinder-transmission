@@ -186,10 +186,17 @@ function renderHistoryStatusCell(item) {
   const classes = [];
   if (status === 'import_failed') classes.push('history-status-failed');
   if (status === 'importing') classes.push('history-status-active');
+  const labels = {
+    added: 'Added',
+    importing: 'Importing',
+    imported: 'Imported',
+    import_failed: 'Failure'
+  };
+  const label = labels[status] || status;
 
   const statusHtml = classes.length
-    ? `<span class="${classes.join(' ')}">${escapeHtml(status)}</span>`
-    : escapeHtml(status);
+    ? `<span class="${classes.join(' ')}">${escapeHtml(label)}</span>`
+    : escapeHtml(label);
   const detailHtml = detail
     ? `<div class="history-status-detail">${escapeHtml(truncateText(detail))}</div>`
     : '';

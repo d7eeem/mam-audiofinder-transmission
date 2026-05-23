@@ -1,6 +1,6 @@
 # MAM Book Finder
 
-Lightweight web app and API for searching MyAnonamouse, sending downloads to Transmission, and copying completed books into audiobook and ebook libraries.
+Lightweight web app and API for searching MyAnonamouse, sending downloads to Transmission, and hardlinking completed books into audiobook and ebook libraries.
 
 ## Screenshots
 
@@ -13,23 +13,21 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 - Search MAM for audiobooks and ebooks
 - Add torrents to Transmission with a dedicated label
 - Track download history
-- Auto-import completed downloads into `/library` or `/ebooks`
+- Auto-import completed downloads into `/library` or `/ebooks` using hardlinks
 
 ## Requirements
 
 - Docker and Docker Compose
 - Transmission with RPC enabled
 - A valid MAM session cookie
-- Mounted host paths for `/data`, `/downloads`, `/library`, and `/ebooks`
+- Mounted host paths for `/data` and one shared media root containing downloads and libraries
 
 ## Quick Start
 
 1. Set your MAM and Transmission settings in `docker-compose.yml`.
 2. Mount your host storage to the in-container paths:
    - `/data` for the SQLite database
-   - `/downloads` for Transmission downloads
-   - `/library` for audiobooks
-   - `/ebooks` for ebooks
+   - `/storage` for a shared media root with `downloads`, `audiobooks`, and `ebooks` subdirectories
 3. Start the app:
 
    ```bash
@@ -38,7 +36,9 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 
 4. Open the UI at `http://localhost:8080`.
 
-If you use Transmission in Docker, mount the same host downloads directory there too so completed paths resolve under `/downloads`.
+The app exposes `/downloads`, `/library`, and `/ebooks` as symlinks into `/storage/downloads`, `/storage/audiobooks`, and `/storage/ebooks`. This keeps the app paths stable while allowing hardlinks to work.
+
+If you use Transmission in Docker, mount the same host media root or downloads subdirectory there so completed paths still resolve under `/downloads`. Downloads and library folders must live on the same filesystem; otherwise imports fail and the History table shows `Failure` with the hardlink error.
 
 ## Configuration
 

@@ -1,4 +1,4 @@
-import os, json, re, base64, asyncio, logging
+import os, json, re, base64, asyncio, logging, errno
 from pathlib import Path
 import shutil
 import httpx
@@ -513,9 +513,25 @@ def next_available(path: Path) -> Path:
             return cand
         i += 1
 
-def copy_one(src: Path, dst: Path):
+def hardlink_one(src: Path, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    try:
+        os.link(src, dst)
+    except FileNotFoundError:
+        raise HTTPException(status_code=400, detail=f"Import source file not found: {src}")
+    except FileExistsError:
+        raise HTTPException(status_code=400, detail=f"Import destination already exists: {dst}")
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            detail = (
+                f"Could not hardlink '{src}' to '{dst}' because they are on different filesystems. "
+                "Mount downloads and library paths from one shared parent directory."
+            )
+        elif exc.errno in (errno.EPERM, errno.EACCES):
+            detail = f"Could not hardlink '{src}' to '{dst}': permission denied."
+        else:
+            detail = f"Could not hardlink '{src}' to '{dst}': {exc.strerror or exc}"
+        raise HTTPException(status_code=400, detail=detail)
 
 def clean_status_detail(detail: str | None) -> str | None:
     text_value = re.sub(r"\s+", " ", (detail or "").strip())
@@ -666,28 +682,33 @@ async def import_torrent_to_library(author: str, title: str, h: str, media_type:
     roots = {name.split("/", 1)[0] for name in names if "/" in name}
     common_root = next(iter(roots)) if len(roots) == 1 and all(name == next(iter(roots)) or name.startswith(next(iter(roots)) + "/") for name in names) else ""
 
-    # Copy all files (skip .cue).
-    copied = 0
-    if len(names) == 1:
-        src = source_dir / names[0]
-        if src.suffix.lower() == ".cue":
-            raise HTTPException(status_code=400, detail="Only .cue file found; nothing to import")
-        copy_one(src, dest_dir / src.name)
-        copied += 1
-    else:
-        for name in names:
-            src = source_dir / name
+    # Hardlink all files (skip .cue).
+    linked = 0
+    try:
+        if len(names) == 1:
+            src = source_dir / names[0]
             if src.suffix.lower() == ".cue":
-                continue
-            rel_name = name
-            if common_root and name.startswith(common_root + "/"):
-                rel_name = name[len(common_root) + 1:]
-            if not rel_name:
-                continue
-            copy_one(src, dest_dir / rel_name)
-            copied += 1
+                raise HTTPException(status_code=400, detail="Only .cue file found; nothing to import")
+            hardlink_one(src, dest_dir / src.name)
+            linked += 1
+        else:
+            for name in names:
+                src = source_dir / name
+                if src.suffix.lower() == ".cue":
+                    continue
+                rel_name = name
+                if common_root and name.startswith(common_root + "/"):
+                    rel_name = name[len(common_root) + 1:]
+                if not rel_name:
+                    continue
+                hardlink_one(src, dest_dir / rel_name)
+                linked += 1
+    except Exception:
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
 
-    if copied == 0:
+    if linked == 0:
         raise HTTPException(status_code=400, detail="No importable files found")
 
     return str(dest_dir)
