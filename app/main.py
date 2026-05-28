@@ -381,8 +381,8 @@ async def add_to_transmission(body: AddBody):
             ]
         else:
             id_candidates = [
-                f"{settings.MAM_BASE}/tor/download.php?id={mam_id}",
                 f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}",
+                f"{settings.MAM_BASE}/tor/download.php?id={mam_id}",
             ]
 
     torrent_hash = None

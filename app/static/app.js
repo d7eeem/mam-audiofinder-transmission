@@ -112,7 +112,7 @@ async function runSearch() {
               author: it.author_info || '',
               narrator: it.narrator_info || '',
               media_type: it.media_type || mediaType,
-              use_fl: Boolean(it.id) && !Boolean(it.is_freeleech) && Boolean(useFlCheckbox?.checked)
+              use_fl: Boolean(useFlCheckbox?.checked)
             })
           });
           addBtn.textContent = 'Added';
