@@ -58,6 +58,8 @@ class Settings:
     def __init__(self) -> None:
         self.MAM_BASE = DEFAULT_MAM_BASE
         self.MAM_COOKIE = build_mam_cookie(os.getenv("MAM_COOKIE", ""))
+        if not self.MAM_COOKIE:
+            raise RuntimeError("MAM_COOKIE environment variable is required and must be set to a non-empty value")
         self.TRANSMISSION_URL = os.getenv("TRANSMISSION_URL", "http://transmission:9091/transmission/rpc").rstrip("/")
         self.TRANSMISSION_USER = os.getenv("TRANSMISSION_USER", "")
         self.TRANSMISSION_PASS = os.getenv("TRANSMISSION_PASS", "")
@@ -147,9 +149,6 @@ async def home(request: Request):
 # ---------------------------- Search ----------------------------
 @app.post("/search")
 async def search(payload: dict):
-    if not settings.MAM_COOKIE:
-        raise HTTPException(status_code=500, detail="MAM_COOKIE not set on server")
-
     media_type = normalize_media_type(payload.get("media_type"))
     tor = payload.get("tor", {}) or {}
     tor.setdefault("text", "")
@@ -368,37 +367,13 @@ async def add_to_transmission(body: AddBody):
     dl = (body.dl or "").strip()
     use_fl = bool(body.use_fl)
 
-    if not mam_id and not dl:
-        raise HTTPException(status_code=400, detail="Missing MAM id and dl; need at least one")
-    if use_fl and not mam_id:
-        raise HTTPException(status_code=400, detail="use_fl requires a MAM id")
+    if not mam_id:
+        raise HTTPException(status_code=400, detail="Missing MAM id")
 
-    direct_url = f"{settings.MAM_BASE}/tor/download.php/{dl}" if dl else None
-    id_candidates = []
-    if mam_id:
-        suffix = "&fl=1" if use_fl else ""
-        id_candidates = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}{suffix}"]
-
-    torrent_hash = None
+    suffix = "&fl=1" if use_fl else ""
+    candidate_url = f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}{suffix}"
 
     async with httpx.AsyncClient(timeout=60) as client:
-        # Try URL add first if we have a cookie-less direct link
-        if direct_url and not use_fl:
-            try:
-                args = await transmission_rpc(
-                    client,
-                    "torrent-add",
-                    torrent_add_arguments(mam_id, "filename", direct_url),
-                )
-                torrent_hash = torrent_hash_from_add_result(args)
-                insert_history(mam_id, title, author, narrator, media_type, dl, torrent_hash)
-                return {"ok": True}
-            except HTTPException:
-                if not id_candidates:
-                    raise
-                # fall through to cookie-authenticated fetch/upload
-
-        # Cookie-authenticated fetch of .torrent, then upload
         mam_headers = {
             "Cookie": settings.MAM_COOKIE,
             "User-Agent": "Mozilla/5.0",
@@ -406,17 +381,11 @@ async def add_to_transmission(body: AddBody):
             "Referer": "https://www.myanonamouse.net/",
             "Origin": "https://www.myanonamouse.net",
         }
-        torrent_bytes = None
-        for url in id_candidates:
-            resp = await client.get(url, headers=mam_headers)
-            if resp.status_code == 200 and resp.content:
-                torrent_bytes = resp.content
-                break
+        resp = await client.get(candidate_url, headers=mam_headers)
+        if resp.status_code != 200 or not resp.content:
+            raise HTTPException(status_code=502, detail=f"Could not fetch .torrent from MAM (status: {resp.status_code}).")
 
-        if not torrent_bytes:
-            raise HTTPException(status_code=502, detail="Could not fetch .torrent from MAM (no dl hash and cookie fetch failed).")
-
-        metainfo = base64.b64encode(torrent_bytes).decode("ascii")
+        metainfo = base64.b64encode(resp.content).decode("ascii")
         args = await transmission_rpc(
             client,
             "torrent-add",
