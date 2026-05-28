@@ -356,6 +356,7 @@ class AddBody(BaseModel):
     author: str | None = None
     narrator: str | None = None
     media_type: str | None = None
+    use_fl: bool = False
 
 @app.post("/add")
 async def add_to_transmission(body: AddBody):
@@ -365,6 +366,7 @@ async def add_to_transmission(body: AddBody):
     narrator = (body.narrator or "").strip()
     media_type = normalize_media_type(body.media_type)
     dl = (body.dl or "").strip()
+    use_fl = bool(body.use_fl)
 
     if not mam_id and not dl:
         raise HTTPException(status_code=400, detail="Missing MAM id and dl; need at least one")
@@ -372,10 +374,13 @@ async def add_to_transmission(body: AddBody):
     direct_url = f"{settings.MAM_BASE}/tor/download.php/{dl}" if dl else None
     id_candidates = []
     if mam_id:
-        id_candidates = [
-            f"{settings.MAM_BASE}/tor/download.php?id={mam_id}",
-            f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}",
-        ]
+        if use_fl:
+            id_candidates = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}&fl=1"]
+        else:
+            id_candidates = [
+                f"{settings.MAM_BASE}/tor/download.php?id={mam_id}",
+                f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}",
+            ]
 
     torrent_hash = None
 
