@@ -375,7 +375,10 @@ async def add_to_transmission(body: AddBody):
     id_candidates = []
     if mam_id:
         if use_fl:
-            id_candidates = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}&fl=1"]
+            id_candidates = [
+                f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}&fl=1",
+                f"{settings.MAM_BASE}/tor/download.php?id={mam_id}&fl=1",
+            ]
         else:
             id_candidates = [
                 f"{settings.MAM_BASE}/tor/download.php?id={mam_id}",

@@ -9,3 +9,6 @@ __pycache__/
 
 # OS/editor
 .DS_Store
+
+# Local generated files
+.tmp-compose-config.out
