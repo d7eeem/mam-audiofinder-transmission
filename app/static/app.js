@@ -89,6 +89,12 @@ async function runSearch() {
     rows.forEach((it) => {
       const tr = document.createElement('tr');
       const detailsURL = it.id ? `https://www.myanonamouse.net/t/${encodeURIComponent(it.id)}` : '';
+      let useFlCheckbox = null;
+      if (!it?.is_freeleech) {
+        useFlCheckbox = document.createElement('input');
+        useFlCheckbox.type = 'checkbox';
+        useFlCheckbox.disabled = !it.id;
+      }
       const addBtn = document.createElement('button');
       addBtn.textContent = 'Add';
       addBtn.disabled = !(it.dl || it.id);
@@ -105,7 +111,8 @@ async function runSearch() {
               dl: it.dl || '',
               author: it.author_info || '',
               narrator: it.narrator_info || '',
-              media_type: it.media_type || mediaType
+              media_type: it.media_type || mediaType,
+              use_fl: Boolean(useFlCheckbox?.checked)
             })
           });
           addBtn.textContent = 'Added';
@@ -132,7 +139,22 @@ async function runSearch() {
       `;
 
       applyDataLabels(table, tr);
-      tr.lastElementChild.appendChild(addBtn);
+      const actionCell = tr.lastElementChild;
+      if (useFlCheckbox) {
+        const wedgeLabel = document.createElement('label');
+        wedgeLabel.style.display = 'inline-flex';
+        wedgeLabel.style.alignItems = 'center';
+        wedgeLabel.style.gap = '0.3rem';
+        wedgeLabel.style.marginBottom = '0.35rem';
+
+        if (!it.id) wedgeLabel.title = 'Requires torrent id';
+
+        wedgeLabel.appendChild(useFlCheckbox);
+        wedgeLabel.append(document.createTextNode('Use FL Wedge'));
+        actionCell.appendChild(wedgeLabel);
+        actionCell.appendChild(document.createElement('br'));
+      }
+      actionCell.appendChild(addBtn);
       tbody.appendChild(tr);
     });
 
