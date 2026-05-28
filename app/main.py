@@ -370,26 +370,20 @@ async def add_to_transmission(body: AddBody):
 
     if not mam_id and not dl:
         raise HTTPException(status_code=400, detail="Missing MAM id and dl; need at least one")
+    if use_fl and not mam_id:
+        raise HTTPException(status_code=400, detail="use_fl requires a MAM id")
 
     direct_url = f"{settings.MAM_BASE}/tor/download.php/{dl}" if dl else None
     id_candidates = []
     if mam_id:
-        if use_fl:
-            id_candidates = [
-                f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}&fl=1",
-                f"{settings.MAM_BASE}/tor/download.php?id={mam_id}&fl=1",
-            ]
-        else:
-            id_candidates = [
-                f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}",
-                f"{settings.MAM_BASE}/tor/download.php?id={mam_id}",
-            ]
+        suffix = "&fl=1" if use_fl else ""
+        id_candidates = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}{suffix}"]
 
     torrent_hash = None
 
     async with httpx.AsyncClient(timeout=60) as client:
         # Try URL add first if we have a cookie-less direct link
-        if direct_url:
+        if direct_url and not use_fl:
             try:
                 args = await transmission_rpc(
                     client,
