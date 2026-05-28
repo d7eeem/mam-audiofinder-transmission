@@ -130,6 +130,42 @@ def ensure_history_schema() -> None:
 
 ensure_history_schema()
 
+def mam_headers(*, torrent: bool = False) -> dict:
+    headers = {
+        "Cookie": settings.MAM_COOKIE,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.myanonamouse.net/",
+        "Origin": "https://www.myanonamouse.net",
+    }
+    if torrent:
+        headers["Accept"] = "application/x-bittorrent, */*"
+    else:
+        headers["Accept"] = "application/json, text/plain, */*"
+    return headers
+
+async def fetch_account_summary(client: httpx.AsyncClient) -> dict:
+    resp = await client.get(f"{settings.MAM_BASE}/jsonLoad.php", headers=mam_headers())
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"MAM account summary failed: {resp.status_code}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="MAM account summary returned non-JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="MAM account summary returned unexpected data")
+    return data
+
+async def fetch_freeleech_wedge_count(client: httpx.AsyncClient) -> int | None:
+    data = await fetch_account_summary(client)
+    wedges = data.get("wedges")
+    if wedges is None:
+        return None
+    try:
+        value = int(wedges)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
 # ---------------------------- App ----------------------------
 app = FastAPI(title="MAM Book Finder", version=APP_VERSION)
 app.state.auto_import_task = None
@@ -187,6 +223,9 @@ async def search(payload: dict):
         raw = r.json()
     except ValueError:
         raise HTTPException(status_code=502, detail=f"MAM returned non-JSON. Body: {r.text[:300]}")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        freeleech_wedges = await fetch_freeleech_wedge_count(client)
 
     def flatten(v):
         # {"8320":"John Steinbeck"} or JSON-string -> "John Steinbeck"
@@ -250,6 +289,7 @@ async def search(payload: dict):
         "results": out,
         "total": raw.get("total"),
         "total_found": raw.get("total_found"),
+        "freeleech_wedges": freeleech_wedges,
     })
 
 # ---------------------------- Transmission RPC helpers ----------------------------
@@ -355,7 +395,6 @@ class AddBody(BaseModel):
     author: str | None = None
     narrator: str | None = None
     media_type: str | None = None
-    use_fl: bool = False
 
 @app.post("/add")
 async def add_to_transmission(body: AddBody):
@@ -365,25 +404,32 @@ async def add_to_transmission(body: AddBody):
     narrator = (body.narrator or "").strip()
     media_type = normalize_media_type(body.media_type)
     dl = (body.dl or "").strip()
-    use_fl = bool(body.use_fl)
 
     if not mam_id:
         raise HTTPException(status_code=400, detail="Missing MAM id")
 
-    suffix = "&fl=1" if use_fl else ""
-    candidate_url = f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}{suffix}"
+    freeleech_wedges = None
+    use_fl = False
+    used_fl = False
+    async with httpx.AsyncClient(timeout=30) as status_client:
+        freeleech_wedges = await fetch_freeleech_wedge_count(status_client)
+        use_fl = bool(freeleech_wedges and freeleech_wedges > 0)
 
     async with httpx.AsyncClient(timeout=60) as client:
-        mam_headers = {
-            "Cookie": settings.MAM_COOKIE,
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/x-bittorrent, */*",
-            "Referer": "https://www.myanonamouse.net/",
-            "Origin": "https://www.myanonamouse.net",
-        }
-        resp = await client.get(candidate_url, headers=mam_headers)
-        if resp.status_code != 200 or not resp.content:
-            raise HTTPException(status_code=502, detail=f"Could not fetch .torrent from MAM (status: {resp.status_code}).")
+        candidate_urls = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}"]
+        if use_fl:
+            candidate_urls.insert(0, f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}&fl=1")
+
+        resp = None
+        for candidate_url in candidate_urls:
+            resp = await client.get(candidate_url, headers=mam_headers(torrent=True))
+            if resp.status_code == 200 and resp.content:
+                used_fl = candidate_url.endswith("&fl=1")
+                break
+
+        if resp is None or resp.status_code != 200 or not resp.content:
+            status = "unknown" if resp is None else resp.status_code
+            raise HTTPException(status_code=502, detail=f"Could not fetch .torrent from MAM (status: {status}).")
 
         metainfo = base64.b64encode(resp.content).decode("ascii")
         args = await transmission_rpc(
@@ -394,7 +440,16 @@ async def add_to_transmission(body: AddBody):
         torrent_hash = torrent_hash_from_add_result(args)
         insert_history(mam_id, title, author, narrator, media_type, dl, torrent_hash)
 
-    return {"ok": True}
+    if used_fl and freeleech_wedges is not None:
+        freeleech_wedges = max(freeleech_wedges - 1, 0)
+
+    return {"ok": True, "freeleech_wedges": freeleech_wedges}
+
+@app.get("/account")
+async def account_status():
+    async with httpx.AsyncClient(timeout=30) as client:
+        freeleech_wedges = await fetch_freeleech_wedge_count(client)
+    return {"freeleech_wedges": freeleech_wedges}
 
 # ---------------------------- History ----------------------------
 @app.get("/history")

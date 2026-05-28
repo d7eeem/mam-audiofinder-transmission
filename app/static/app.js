@@ -3,6 +3,7 @@ const form = document.getElementById('searchForm');
 const q = document.getElementById('q');
 const mediaTypeInputs = Array.from(document.querySelectorAll('input[name="mediaType"]'));
 const perpageSel = document.getElementById('perpage');
+const accountStatusEl = document.getElementById('accountStatus');
 const statusEl = document.getElementById('status');
 const table = document.getElementById('results');
 const tbody = table.querySelector('tbody');
@@ -43,6 +44,8 @@ function updateSearchPlaceholder() {
 mediaTypeInputs.forEach((input) => input.addEventListener('change', updateSearchPlaceholder));
 updateSearchPlaceholder();
 
+refreshAccountStatus();
+
 // Focus the search box on devices where it will not pop open a touch keyboard.
 if (q && window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) q.focus();
 
@@ -80,6 +83,8 @@ async function runSearch() {
       body: JSON.stringify({ media_type: mediaType, tor: { text }, perpage })
     });
 
+    setAccountStatus(data?.freeleech_wedges);
+
     const rows = data.results || [];
     if (!rows.length) {
       statusEl.textContent = 'No results.';
@@ -89,12 +94,6 @@ async function runSearch() {
     rows.forEach((it) => {
       const tr = document.createElement('tr');
       const detailsURL = it.id ? `https://www.myanonamouse.net/t/${encodeURIComponent(it.id)}` : '';
-      let useFlCheckbox = null;
-      if (!it?.is_freeleech) {
-        useFlCheckbox = document.createElement('input');
-        useFlCheckbox.type = 'checkbox';
-        useFlCheckbox.disabled = !it.id;
-      }
       const addBtn = document.createElement('button');
       addBtn.textContent = 'Add';
       addBtn.disabled = !(it.dl || it.id);
@@ -102,7 +101,7 @@ async function runSearch() {
         addBtn.disabled = true;
         addBtn.textContent = 'Adding...';
         try {
-          await fetchJson('/add', {
+          const result = await fetchJson('/add', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -111,10 +110,10 @@ async function runSearch() {
               dl: it.dl || '',
               author: it.author_info || '',
               narrator: it.narrator_info || '',
-              media_type: it.media_type || mediaType,
-              use_fl: Boolean(useFlCheckbox?.checked)
+              media_type: it.media_type || mediaType
             })
           });
+          setAccountStatus(result?.freeleech_wedges);
           addBtn.textContent = 'Added';
           await loadHistory();
         } catch (e) {
@@ -140,20 +139,6 @@ async function runSearch() {
 
       applyDataLabels(table, tr);
       const actionCell = tr.lastElementChild;
-      if (useFlCheckbox) {
-        const wedgeLabel = document.createElement('label');
-        wedgeLabel.style.display = 'inline-flex';
-        wedgeLabel.style.alignItems = 'center';
-        wedgeLabel.style.gap = '0.3rem';
-        wedgeLabel.style.marginBottom = '0.35rem';
-
-        if (!it.id) wedgeLabel.title = 'Requires torrent id';
-
-        wedgeLabel.appendChild(useFlCheckbox);
-        wedgeLabel.append(document.createTextNode('Use FL Wedge'));
-        actionCell.appendChild(wedgeLabel);
-        actionCell.appendChild(document.createElement('br'));
-      }
       actionCell.appendChild(addBtn);
       tbody.appendChild(tr);
     });
@@ -164,6 +149,23 @@ async function runSearch() {
   } catch (e) {
     console.error(e);
     statusEl.textContent = 'Search failed.';
+  }
+}
+
+function setAccountStatus(value) {
+  if (!accountStatusEl) return;
+  accountStatusEl.textContent = `Freeleech wedges: ${value ?? 'unknown'}`;
+}
+
+async function refreshAccountStatus() {
+  if (!accountStatusEl) return;
+  accountStatusEl.textContent = 'Freeleech wedges: loading...';
+  try {
+    const data = await fetchJson('/account');
+    setAccountStatus(data?.freeleech_wedges);
+  } catch (e) {
+    console.error('account status failed', e);
+    accountStatusEl.textContent = 'Freeleech wedges: unavailable';
   }
 }
 
