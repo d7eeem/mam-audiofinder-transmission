@@ -431,7 +431,7 @@ async def add_to_transmission(body: AddBody):
     used_fl = False
     async with httpx.AsyncClient(timeout=30) as status_client:
         freeleech_wedges = await fetch_freeleech_wedge_count(status_client)
-        use_fl = bool(freeleech_wedges and freeleech_wedges > 0)
+        use_fl = media_type == MEDIA_TYPE_AUDIOBOOK and bool(freeleech_wedges and freeleech_wedges > 0)
 
     async with httpx.AsyncClient(timeout=60) as client:
         candidate_urls = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}"]
