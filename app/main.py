@@ -16,9 +16,11 @@ logger = logging.getLogger("mam_audiofinder")
 DOWNLOADS_DIR = "/downloads"
 LIBRARY_DIR = "/library"
 EBOOKS_DIR = "/ebooks"
+EBOOKS_NOSEND_DIR = "/ebooks-nosend"
 DEFAULT_AUTO_IMPORT_POLL_INTERVAL = 30
 DEFAULT_MAM_BASE = "https://www.myanonamouse.net"
 DEFAULT_TRANSMISSION_LABEL = "mam-audiofinder"
+TRANSMISSION_NOSEND_LABEL = "kindle-nosend"
 DEFAULT_UMASK = "0002"
 MEDIA_TYPE_AUDIOBOOK = "audiobook"
 MEDIA_TYPE_EBOOK = "ebook"
@@ -67,6 +69,7 @@ class Settings:
         self.DOWNLOADS_DIR = DOWNLOADS_DIR
         self.LIBRARY_DIR = LIBRARY_DIR
         self.EBOOKS_DIR = EBOOKS_DIR
+        self.EBOOKS_NOSEND_DIR = EBOOKS_NOSEND_DIR
 
         self.UMASK = DEFAULT_UMASK
         self.AUTO_IMPORT_POLL_INTERVAL = DEFAULT_AUTO_IMPORT_POLL_INTERVAL
@@ -112,10 +115,17 @@ def ensure_history_schema() -> None:
             cx.execute(text("ALTER TABLE history ADD COLUMN status_updated_at TEXT"))
         if "media_type" not in cols:
             cx.execute(text("ALTER TABLE history ADD COLUMN media_type TEXT"))
+        if "send_to_kindle" not in cols:
+            cx.execute(text("ALTER TABLE history ADD COLUMN send_to_kindle INTEGER DEFAULT 1"))
         cx.execute(text("""
             UPDATE history
             SET media_type = 'audiobook'
             WHERE media_type IS NULL OR trim(media_type) = ''
+        """))
+        cx.execute(text("""
+            UPDATE history
+            SET send_to_kindle = 1
+            WHERE send_to_kindle IS NULL
         """))
         cx.execute(text("""
             UPDATE history
@@ -316,17 +326,19 @@ async def transmission_rpc(client: httpx.AsyncClient, method: str, arguments: di
         raise HTTPException(status_code=502, detail=f"Transmission {method} failed: {data.get('result')}")
     return data.get("arguments") or {}
 
-def transmission_labels(mam_id: str = "") -> list[str]:
+def transmission_labels(mam_id: str = "", media_type: str = MEDIA_TYPE_AUDIOBOOK, send_to_kindle: bool = True) -> list[str]:
     labels = []
     if settings.TRANSMISSION_LABEL:
         labels.append(settings.TRANSMISSION_LABEL)
     if mam_id:
         labels.append(f"mamid={mam_id}")
+    if normalize_media_type(media_type) == MEDIA_TYPE_EBOOK and not send_to_kindle:
+        labels.append(TRANSMISSION_NOSEND_LABEL)
     return labels
 
-def torrent_add_arguments(mam_id: str, source_key: str, source_value: str) -> dict:
+def torrent_add_arguments(mam_id: str, source_key: str, source_value: str, media_type: str, send_to_kindle: bool) -> dict:
     args = {source_key: source_value}
-    labels = transmission_labels(mam_id)
+    labels = transmission_labels(mam_id, media_type, send_to_kindle)
     if labels:
         args["labels"] = labels
     return args
@@ -341,6 +353,7 @@ def insert_history(
     author: str,
     narrator: str,
     media_type: str,
+    send_to_kindle: bool,
     dl: str,
     torrent_hash: str | None,
 ):
@@ -353,6 +366,7 @@ def insert_history(
                 author,
                 narrator,
                 media_type,
+                send_to_kindle,
                 dl,
                 torrent_status,
                 torrent_hash,
@@ -366,6 +380,7 @@ def insert_history(
                 :author,
                 :narrator,
                 :media_type,
+                :send_to_kindle,
                 :dl,
                 :torrent_status,
                 :torrent_hash,
@@ -379,6 +394,7 @@ def insert_history(
             "author": author,
             "narrator": narrator,
             "media_type": normalize_media_type(media_type),
+            "send_to_kindle": 1 if send_to_kindle else 0,
             "dl": dl,
             "torrent_status": "added",
             "torrent_hash": torrent_hash,
@@ -395,6 +411,7 @@ class AddBody(BaseModel):
     author: str | None = None
     narrator: str | None = None
     media_type: str | None = None
+    send_to_kindle: bool | None = None
 
 @app.post("/add")
 async def add_to_transmission(body: AddBody):
@@ -403,6 +420,7 @@ async def add_to_transmission(body: AddBody):
     author = (body.author or "").strip()
     narrator = (body.narrator or "").strip()
     media_type = normalize_media_type(body.media_type)
+    send_to_kindle = True if body.send_to_kindle is None else bool(body.send_to_kindle)
     dl = (body.dl or "").strip()
 
     if not mam_id:
@@ -435,10 +453,10 @@ async def add_to_transmission(body: AddBody):
         args = await transmission_rpc(
             client,
             "torrent-add",
-            torrent_add_arguments(mam_id, "metainfo", metainfo),
+            torrent_add_arguments(mam_id, "metainfo", metainfo, media_type, send_to_kindle),
         )
         torrent_hash = torrent_hash_from_add_result(args)
-        insert_history(mam_id, title, author, narrator, media_type, dl, torrent_hash)
+        insert_history(mam_id, title, author, narrator, media_type, send_to_kindle, dl, torrent_hash)
 
     if used_fl and freeleech_wedges is not None:
         freeleech_wedges = max(freeleech_wedges - 1, 0)
@@ -463,6 +481,7 @@ def history():
                 author,
                 narrator,
                 media_type,
+                send_to_kindle,
                 dl,
                 torrent_hash,
                 added_at,
@@ -480,7 +499,7 @@ def history():
 async def retry_history_import(history_id: int):
     with engine.begin() as cx:
         row = cx.execute(text("""
-            SELECT id, title, author, torrent_hash, torrent_status, media_type
+            SELECT id, title, author, torrent_hash, torrent_status, media_type, send_to_kindle
             FROM history
             WHERE id = :id
         """), {"id": history_id}).mappings().first()
@@ -509,7 +528,7 @@ async def retry_history_import(history_id: int):
     update_history_status(history_id, "importing")
 
     try:
-        await import_torrent_to_library(author, title, torrent_hash, media_type)
+        await import_torrent_to_library(author, title, torrent_hash, media_type, bool(row.get("send_to_kindle", 1)))
     except HTTPException as exc:
         mark_history_failed(history_id, torrent_hash, str(exc.detail))
         raise
@@ -693,7 +712,7 @@ def get_auto_import_candidates(completed_hashes: set[str]) -> list[dict]:
         return []
     with engine.begin() as cx:
         rows = cx.execute(text("""
-            SELECT id, title, author, torrent_hash, torrent_status, media_type
+            SELECT id, title, author, torrent_hash, torrent_status, media_type, send_to_kindle
             FROM history
             WHERE
                 torrent_hash IS NOT NULL
@@ -734,7 +753,7 @@ def is_transient_auto_import_error(exc: HTTPException) -> bool:
     detail = str(exc.detail)
     return exc.status_code == 502 and detail.startswith("Transmission")
 
-async def import_torrent_to_library(author: str, title: str, h: str, media_type: str = MEDIA_TYPE_AUDIOBOOK) -> str:
+async def import_torrent_to_library(author: str, title: str, h: str, media_type: str = MEDIA_TYPE_AUDIOBOOK, send_to_kindle: bool = True) -> str:
     media_type = normalize_media_type(media_type)
     author = sanitize(author)
     title = sanitize(title)
@@ -756,8 +775,11 @@ async def import_torrent_to_library(author: str, title: str, h: str, media_type:
 
     source_dir = Path(validate_download_path(download_dir))
 
-    # Destination: /library/Author/Title or /ebooks/Author/Title.
-    lib = Path(settings.EBOOKS_DIR if media_type == MEDIA_TYPE_EBOOK else settings.LIBRARY_DIR)
+    # Destination: /library/Author/Title, /ebooks/Author/Title, or /ebooks-nosend/Author/Title.
+    if media_type == MEDIA_TYPE_EBOOK:
+        lib = Path(settings.EBOOKS_DIR if send_to_kindle else settings.EBOOKS_NOSEND_DIR)
+    else:
+        lib = Path(settings.LIBRARY_DIR)
     author_dir = lib / author
     author_dir.mkdir(parents=True, exist_ok=True)
     dest_dir = next_available(author_dir / title)
@@ -821,7 +843,7 @@ async def auto_import_cycle():
         update_history_status(history_id, "importing")
 
         try:
-            await import_torrent_to_library(author, title, torrent_hash, media_type)
+            await import_torrent_to_library(author, title, torrent_hash, media_type, bool(row.get("send_to_kindle", 1)))
         except HTTPException as exc:
             if is_transient_auto_import_error(exc):
                 update_history_status(history_id, "added")

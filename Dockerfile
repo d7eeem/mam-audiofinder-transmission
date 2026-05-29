@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN mkdir -p /storage /ebooks \
+RUN mkdir -p /storage /ebooks /ebooks-nosend \
     && ln -s /storage/downloads /downloads \
     && ln -s /storage/audiobooks /library
 COPY app/ /app/

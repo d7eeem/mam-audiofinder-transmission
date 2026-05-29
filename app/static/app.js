@@ -2,6 +2,8 @@
 const form = document.getElementById('searchForm');
 const q = document.getElementById('q');
 const mediaTypeInputs = Array.from(document.querySelectorAll('input[name="mediaType"]'));
+const kindleToggle = document.getElementById('kindleToggle');
+const sendToKindleInput = document.getElementById('sendToKindle');
 const perpageSel = document.getElementById('perpage');
 const accountStatusEl = document.getElementById('accountStatus');
 const statusEl = document.getElementById('status');
@@ -30,15 +32,26 @@ function mediaTypeLabel(value) {
   return normalizeMediaType(value) === 'ebook' ? 'Ebook' : 'Audiobook';
 }
 
-function renderMediaTypeBadge(value) {
-  return `<span class="type-badge">${escapeHtml(mediaTypeLabel(value))}</span>`;
+function getSendToKindle() {
+  return sendToKindleInput ? sendToKindleInput.checked : true;
+}
+
+function renderMediaTypeBadge(value, sendToKindle = true) {
+  const mediaType = normalizeMediaType(value);
+  const badges = [`<span class="type-badge">${escapeHtml(mediaTypeLabel(mediaType))}</span>`];
+  if (mediaType === 'ebook' && !sendToKindle) {
+    badges.push('<span class="type-badge type-badge-nosend">No Kindle</span>');
+  }
+  return badges.join(' ');
 }
 
 function updateSearchPlaceholder() {
   if (!q) return;
-  q.placeholder = getSelectedMediaType() === 'ebook'
+  const isEbook = getSelectedMediaType() === 'ebook';
+  q.placeholder = isEbook
     ? 'Search title/author'
     : 'Search title/author/narrator';
+  if (kindleToggle) kindleToggle.hidden = !isEbook;
 }
 
 mediaTypeInputs.forEach((input) => input.addEventListener('change', updateSearchPlaceholder));
@@ -110,7 +123,8 @@ async function runSearch() {
               dl: it.dl || '',
               author: it.author_info || '',
               narrator: it.narrator_info || '',
-              media_type: it.media_type || mediaType
+              media_type: it.media_type || mediaType,
+              send_to_kindle: normalizeMediaType(it.media_type || mediaType) !== 'ebook' || getSendToKindle()
             })
           });
           setAccountStatus(result?.freeleech_wedges);
@@ -308,7 +322,7 @@ async function loadHistory() {
       const mediaType = normalizeMediaType(item.media_type);
 
       tr.innerHTML = `
-        <td>${renderMediaTypeBadge(mediaType)}</td>
+        <td>${renderMediaTypeBadge(mediaType, item.send_to_kindle !== 0)}</td>
         <td>${escapeHtml(item.title || '')}</td>
         <td>${escapeHtml(item.author || '')}</td>
         <td>${escapeHtml(item.narrator || '')}</td>

@@ -16,4 +16,5 @@ services:
       # Expected subdirectories: downloads, audiobooks.
       - /path/to/audiobook-media-root:/storage
       - /path/to/ebook-library:/ebooks
+      - /path/to/ebook-nosend-library:/ebooks-nosend
     restart: unless-stopped
