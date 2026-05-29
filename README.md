@@ -15,13 +15,14 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 - Track download history
 - Auto-import completed audiobooks into `/library` using hardlinks
 - Auto-import completed ebooks into `/ebooks` using copies
+- Optionally import ebooks into `/ebooks-nosend` when `Send to Kindle` is unchecked
 
 ## Requirements
 
 - Docker and Docker Compose
 - Transmission with RPC enabled
 - A valid MAM session cookie
-- Mounted host paths for `/data`, one shared audiobook media root, and an ebook library
+- Mounted host paths for `/data`, one shared audiobook media root, an ebook library, and an ebook no-send library
 
 ## Quick Start
 
@@ -30,6 +31,7 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
    - `/data` for the SQLite database
    - `/storage` for a shared audiobook media root with `downloads` and `audiobooks` subdirectories
    - `/ebooks` for ebooks
+   - `/ebooks-nosend` for ebooks that should not be sent to Kindle
 3. Start the app:
 
    ```bash
@@ -40,7 +42,7 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 
 The app exposes `/downloads` and `/library` as symlinks into `/storage/downloads` and `/storage/audiobooks`. This keeps the app paths stable while allowing audiobook hardlinks to work.
 
-If you use Transmission in Docker, mount the same host media root or downloads subdirectory there so completed paths still resolve under `/downloads`. Downloads and the audiobook library must live on the same filesystem; otherwise audiobook imports fail and the History table shows `Failure` with the hardlink error. Ebook imports continue to copy into `/ebooks`.
+If you use Transmission in Docker, mount the same host media root or downloads subdirectory there so completed paths still resolve under `/downloads`. Downloads and the audiobook library must live on the same filesystem; otherwise audiobook imports fail and the History table shows `Failure` with the hardlink error. Ebook imports continue to copy into `/ebooks` or `/ebooks-nosend`.
 
 ## Configuration
 
@@ -57,6 +59,7 @@ Runtime config comes from environment variables in `docker-compose.yml`.
 ## Notes
 
 - Search, add, and history are available from the main UI.
+- The `Send to Kindle` ebook toggle defaults on. When unchecked, new ebook adds are tagged `kindle-nosend` in Transmission and imported into `/ebooks-nosend`.
 - Failed imports show `Failure` in history and can be retried with the row's `Retry` button after fixing the underlying path, mount, or permission issue.
 - The app has no authentication, so do not expose it directly to the public internet.
 
