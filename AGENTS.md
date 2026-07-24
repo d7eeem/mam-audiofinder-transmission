@@ -28,9 +28,9 @@
 
 ## Testing Guidelines
 
-- There is no formal test suite yet.
+- Run the unit tests with `cd app && python -m pytest -q` before pushing.
 - When changing backend logic, at minimum:
-  - Hit `/health`, `/search`, `/add`, and `/history` manually in a dev environment.
+  - Hit `/search`, `/add`, `/account`, and `/history` manually in a dev environment, and exercise the `Retry` action (`POST /history/{id}/retry`) on a failed row.
   - Verify auto-import behavior with a completed torrent in Transmission.
 
 ## Commit & Pull Request Guidelines
@@ -54,3 +54,4 @@
   - Transmission downloads must be mounted at `/downloads`.
   - The Audiobookshelf library must be mounted at `/library`.
   - Configure host paths in `docker-compose.yml`, not through app env vars.
+- The download client is selected by `TORRENT_CLIENT` (`transmission` default, or `qbittorrent`). Both clients import from the same `/downloads` mount inside the app container.

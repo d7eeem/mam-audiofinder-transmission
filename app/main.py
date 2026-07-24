@@ -8,7 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
-from datetime import datetime
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger("mam_audiofinder")
 
@@ -22,6 +23,8 @@ DEFAULT_MAM_BASE = "https://www.myanonamouse.net"
 DEFAULT_TRANSMISSION_LABEL = "mam-audiofinder"
 TRANSMISSION_NOSEND_LABEL = "kindle-nosend"
 DEFAULT_UMASK = "0002"
+DEFAULT_QB_CATEGORY = "mam-audiofinder"
+DEFAULT_NOTIFY_TIMEOUT = 10
 MEDIA_TYPE_AUDIOBOOK = "audiobook"
 MEDIA_TYPE_EBOOK = "ebook"
 MAM_MAIN_CATEGORIES = {
@@ -35,6 +38,35 @@ def is_truthy(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+ALLOWED_PERPAGE = (25, 50, 100)
+
+def normalize_perpage(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 25
+    return n if n in ALLOWED_PERPAGE else 25
+
+def validate_mam_id(mam_id: str) -> str:
+    # MAM torrent ids are numeric. Anything else could inject extra query
+    # parameters into the download URL (e.g. "&fl=1" spends a freeleech wedge).
+    if not re.fullmatch(r"[0-9]+", mam_id):
+        raise HTTPException(status_code=400, detail="Invalid MAM id")
+    return mam_id
+
+def should_use_freeleech(media_type: str, wedges: int | None, reserve: int) -> bool:
+    """Decide whether to spend a freeleech wedge on this add.
+
+    Freeleech is audiobook-only (commit 92c95a3). Above that, a wedge is spent
+    only while the balance is strictly greater than the configured reserve, so
+    a reserve of 0 keeps the historical "spend whenever you have one" behavior.
+    """
+    if media_type != MEDIA_TYPE_AUDIOBOOK:
+        return False
+    if not wedges:
+        return False
+    return wedges > reserve
 
 def build_mam_cookie(raw: str) -> str:
     raw = (raw or "").strip()
@@ -56,6 +88,10 @@ def normalize_media_type(value: str | None) -> str:
         return MEDIA_TYPE_EBOOK
     raise HTTPException(status_code=400, detail="media_type must be audiobook or ebook")
 
+def default_send_to_kindle(value: bool | None) -> bool:
+    # Ebooks default to no-send; the user opts in by enabling "Send to Kindle".
+    return False if value is None else bool(value)
+
 class Settings:
     def __init__(self) -> None:
         self.MAM_BASE = DEFAULT_MAM_BASE
@@ -66,6 +102,20 @@ class Settings:
         self.TRANSMISSION_USER = os.getenv("TRANSMISSION_USER", "")
         self.TRANSMISSION_PASS = os.getenv("TRANSMISSION_PASS", "")
         self.TRANSMISSION_LABEL = DEFAULT_TRANSMISSION_LABEL
+        self.TORRENT_CLIENT = os.getenv("TORRENT_CLIENT", "transmission").strip().lower()
+        if self.TORRENT_CLIENT not in ("transmission", "qbittorrent"):
+            raise RuntimeError("TORRENT_CLIENT must be 'transmission' or 'qbittorrent'")
+        self.QB_URL = os.getenv("QB_URL", "http://qbittorrent:8080").rstrip("/")
+        self.QB_USER = os.getenv("QB_USER", "")
+        self.QB_PASS = os.getenv("QB_PASS", "")
+        self.QB_CATEGORY = os.getenv("QB_CATEGORY", DEFAULT_QB_CATEGORY)
+        self.QB_TAGS = os.getenv("QB_TAGS", "")
+        try:
+            self.FL_WEDGE_MIN_RESERVE = max(0, int(os.getenv("FL_WEDGE_MIN_RESERVE", "0")))
+        except ValueError:
+            raise RuntimeError("FL_WEDGE_MIN_RESERVE must be a non-negative integer")
+        self.NOTIFY_WEBHOOK_URL = os.getenv("NOTIFY_WEBHOOK_URL", "").strip()
+        self.NOTIFY_TIMEOUT = DEFAULT_NOTIFY_TIMEOUT
         self.DOWNLOADS_DIR = DOWNLOADS_DIR
         self.LIBRARY_DIR = LIBRARY_DIR
         self.EBOOKS_DIR = EBOOKS_DIR
@@ -85,11 +135,12 @@ if _um:
         pass
 
 # ---------------------------- DB ----------------------------
-# /data should be a volume/bind mount
-engine = create_engine("sqlite:////data/history.db", future=True)
+# /data should be a volume/bind mount. Override with HISTORY_DB_URL for tests.
+HISTORY_DB_URL = os.getenv("HISTORY_DB_URL", "sqlite:////data/history.db")
+engine = create_engine(HISTORY_DB_URL, future=True)
 
 def utcnow_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def ensure_history_schema() -> None:
     with engine.begin() as cx:
@@ -137,6 +188,16 @@ def ensure_history_schema() -> None:
             SET status_updated_at = COALESCE(status_updated_at, imported_at, added_at)
             WHERE status_updated_at IS NULL
         """))
+        # A row can only be 'importing' if a previous process died mid-import;
+        # reset it so the auto-import poller retries it.
+        cx.execute(text("""
+            UPDATE history
+            SET
+                torrent_status = 'added',
+                status_detail = NULL,
+                status_updated_at = datetime('now')
+            WHERE torrent_status = 'importing'
+        """))
 
 ensure_history_schema()
 
@@ -177,7 +238,15 @@ async def fetch_freeleech_wedge_count(client: httpx.AsyncClient) -> int | None:
     return value if value >= 0 else None
 
 # ---------------------------- App ----------------------------
-app = FastAPI(title="MAM Book Finder", version=APP_VERSION)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await reconcile_auto_import_task()
+    try:
+        yield
+    finally:
+        await stop_auto_import_task()
+
+app = FastAPI(title="MAM Book Finder", version=APP_VERSION, lifespan=lifespan)
 app.state.auto_import_task = None
 app.state.auto_import_stop = None
 
@@ -207,7 +276,7 @@ async def search(payload: dict):
     tor.setdefault("startNumber", "0")
     tor["main_cat"] = [MAM_MAIN_CATEGORIES[media_type]]
 
-    perpage = payload.get("perpage", 25)
+    perpage = normalize_perpage(payload.get("perpage"))
     body = {"tor": tor, "perpage": perpage}
 
     headers = {
@@ -220,22 +289,24 @@ async def search(payload: dict):
     }
     params = {"dlLink": "1"}
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
             r = await client.post(f"{settings.MAM_BASE}/tor/js/loadSearchJSONbasic.php",
                                   headers=headers, params=params, json=body)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"MAM request failed: {e}")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"MAM request failed: {e}")
 
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"MAM HTTP {r.status_code}: {r.text[:300]}")
-    try:
-        raw = r.json()
-    except ValueError:
-        raise HTTPException(status_code=502, detail=f"MAM returned non-JSON. Body: {r.text[:300]}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"MAM HTTP {r.status_code}: {r.text[:300]}")
+        try:
+            raw = r.json()
+        except ValueError:
+            raise HTTPException(status_code=502, detail=f"MAM returned non-JSON. Body: {r.text[:300]}")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        freeleech_wedges = await fetch_freeleech_wedge_count(client)
+        try:
+            freeleech_wedges = await fetch_freeleech_wedge_count(client)
+        except HTTPException:
+            freeleech_wedges = None
 
     def flatten(v):
         # {"8320":"John Steinbeck"} or JSON-string -> "John Steinbeck"
@@ -420,18 +491,19 @@ async def add_to_transmission(body: AddBody):
     author = (body.author or "").strip()
     narrator = (body.narrator or "").strip()
     media_type = normalize_media_type(body.media_type)
-    send_to_kindle = True if body.send_to_kindle is None else bool(body.send_to_kindle)
+    send_to_kindle = default_send_to_kindle(body.send_to_kindle)
     dl = (body.dl or "").strip()
 
     if not mam_id:
         raise HTTPException(status_code=400, detail="Missing MAM id")
+    mam_id = validate_mam_id(mam_id)
 
     freeleech_wedges = None
     use_fl = False
     used_fl = False
     async with httpx.AsyncClient(timeout=30) as status_client:
         freeleech_wedges = await fetch_freeleech_wedge_count(status_client)
-        use_fl = media_type == MEDIA_TYPE_AUDIOBOOK and bool(freeleech_wedges and freeleech_wedges > 0)
+        use_fl = should_use_freeleech(media_type, freeleech_wedges, settings.FL_WEDGE_MIN_RESERVE)
 
     async with httpx.AsyncClient(timeout=60) as client:
         candidate_urls = [f"{settings.MAM_BASE}/tor/download.php?tid={mam_id}"]
@@ -449,13 +521,7 @@ async def add_to_transmission(body: AddBody):
             status = "unknown" if resp is None else resp.status_code
             raise HTTPException(status_code=502, detail=f"Could not fetch .torrent from MAM (status: {status}).")
 
-        metainfo = base64.b64encode(resp.content).decode("ascii")
-        args = await transmission_rpc(
-            client,
-            "torrent-add",
-            torrent_add_arguments(mam_id, "metainfo", metainfo, media_type, send_to_kindle),
-        )
-        torrent_hash = torrent_hash_from_add_result(args)
+        torrent_hash = await get_torrent_client().add_torrent(resp.content, mam_id, media_type, send_to_kindle)
         insert_history(mam_id, title, author, narrator, media_type, send_to_kindle, dl, torrent_hash)
 
     if used_fl and freeleech_wedges is not None:
@@ -545,17 +611,7 @@ async def retry_history_import(history_id: int):
 async def list_completed_torrents() -> list[dict]:
     async with httpx.AsyncClient(timeout=30) as c:
         args = await transmission_rpc(c, "torrent-get", {
-            "fields": [
-                "id",
-                "hashString",
-                "name",
-                "percentDone",
-                "downloadDir",
-                "totalSize",
-                "addedDate",
-                "labels",
-                "files",
-            ],
+            "fields": ["hashString", "percentDone", "labels"],
         })
         infos = args.get("torrents") or []
 
@@ -565,34 +621,164 @@ async def list_completed_torrents() -> list[dict]:
                 continue
             if float(t.get("percentDone") or 0) < 1:
                 continue
-
             h = t.get("hashString")
             if not h:
                 continue
-            files = t.get("files") or []
-            # compute top-level root (before first '/')
-            roots = set()
-            for f in files:
-                name = (f.get("name") or "").lstrip("/")
-                roots.add(name.split("/", 1)[0])
-            root = (list(roots)[0] if roots else t.get("name") or "")
-            single_file = len(files) == 1 and "/" not in (files[0].get("name") or "")
-            out.append({
-                "hash": h,
-                "name": t.get("name"),
-                "download_dir": t.get("downloadDir"),
-                "root": root,
-                "single_file": single_file,
-                "size": t.get("totalSize"),
-                "added_on": t.get("addedDate"),
-            })
+            out.append({"hash": h})
         return out
+
+# ---------------------------- Torrent client abstraction ----------------------------
+
+def qb_tags(mam_id: str = "", media_type: str = MEDIA_TYPE_AUDIOBOOK, send_to_kindle: bool = True) -> list[str]:
+    tags = [t.strip() for t in (settings.QB_TAGS or "").split(",") if t.strip()]
+    if mam_id:
+        tags.append(f"mamid={mam_id}")
+    if normalize_media_type(media_type) == MEDIA_TYPE_EBOOK and not send_to_kindle:
+        tags.append(TRANSMISSION_NOSEND_LABEL)
+    return tags
+
+
+class TorrentClient:
+    async def add_torrent(self, metainfo: bytes, mam_id: str, media_type: str, send_to_kindle: bool) -> str | None:
+        raise NotImplementedError
+
+    async def completed_hashes(self) -> set[str]:
+        raise NotImplementedError
+
+    async def torrent_source(self, torrent_hash: str) -> tuple[list[str], str]:
+        """Return (relative file names, source directory) for a completed torrent."""
+        raise NotImplementedError
+
+
+class TransmissionClient(TorrentClient):
+    async def add_torrent(self, metainfo, mam_id, media_type, send_to_kindle):
+        async with httpx.AsyncClient(timeout=60) as client:
+            b64 = base64.b64encode(metainfo).decode("ascii")
+            args = await transmission_rpc(
+                client, "torrent-add",
+                torrent_add_arguments(mam_id, "metainfo", b64, media_type, send_to_kindle),
+            )
+            return torrent_hash_from_add_result(args)
+
+    async def completed_hashes(self):
+        completed = await list_completed_torrents()
+        return {item.get("hash") for item in completed if item.get("hash")}
+
+    async def torrent_source(self, torrent_hash):
+        async with httpx.AsyncClient(timeout=30) as c:
+            args = await transmission_rpc(c, "torrent-get", {
+                "ids": [torrent_hash],
+                "fields": ["id", "hashString", "name", "downloadDir", "labels", "files"],
+            })
+            torrents = args.get("torrents") or []
+            info = torrents[0] if torrents else {}
+            files = info.get("files") or []
+            if not files:
+                raise HTTPException(status_code=404, detail="No files found for torrent")
+            download_dir = (info.get("downloadDir") or "").rstrip("/")
+            if not download_dir:
+                raise HTTPException(status_code=404, detail="Torrent download directory not found")
+            names = [(f.get("name") or "").lstrip("/") for f in files if f.get("name")]
+            return names, download_dir
+
+
+class QbittorrentClient(TorrentClient):
+    async def _login(self, client: httpx.AsyncClient) -> None:
+        r = await client.post(
+            f"{settings.QB_URL}/api/v2/auth/login",
+            data={"username": settings.QB_USER, "password": settings.QB_PASS},
+        )
+        if r.status_code != 200 or "Ok" not in (r.text or ""):
+            raise HTTPException(status_code=502, detail=f"qBittorrent login failed: {r.status_code}")
+
+    async def _find_added_hash(self, client: httpx.AsyncClient, mam_id: str,
+                               attempts: int = 5, delay: float = 0.5) -> str | None:
+        """Find the hash of a just-added torrent by its mamid tag.
+
+        qBittorrent's torrents/add returns no infohash and registers the torrent
+        asynchronously, so poll briefly. When several torrents share the tag,
+        prefer the most recently added one.
+        """
+        for attempt in range(attempts):
+            r = await client.get(
+                f"{settings.QB_URL}/api/v2/torrents/info",
+                params={"tag": f"mamid={mam_id}", "filter": "all"},
+            )
+            try:
+                arr = r.json()
+            except ValueError:
+                arr = []
+            if isinstance(arr, list) and arr:
+                newest = max(arr, key=lambda t: t.get("added_on") or 0)
+                return newest.get("hash")
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+        return None
+
+    async def add_torrent(self, metainfo, mam_id, media_type, send_to_kindle):
+        async with httpx.AsyncClient(timeout=60) as client:
+            await self._login(client)
+            data = {"category": settings.QB_CATEGORY}
+            tags = qb_tags(mam_id, media_type, send_to_kindle)
+            if tags:
+                data["tags"] = ",".join(tags)
+            files = {"torrents": ("mam.torrent", metainfo, "application/x-bittorrent")}
+            r = await client.post(f"{settings.QB_URL}/api/v2/torrents/add", data=data, files=files)
+            if r.status_code != 200 or "Ok" not in (r.text or ""):
+                raise HTTPException(status_code=502, detail=f"qBittorrent add failed: {r.status_code} {r.text[:160]}")
+            if not mam_id:
+                return None
+            return await self._find_added_hash(client, mam_id)
+
+    async def completed_hashes(self):
+        async with httpx.AsyncClient(timeout=30) as c:
+            await self._login(c)
+            r = await c.get(
+                f"{settings.QB_URL}/api/v2/torrents/info",
+                params={"category": settings.QB_CATEGORY, "filter": "completed"},
+            )
+            try:
+                arr = r.json()
+            except ValueError:
+                arr = []
+            return {t.get("hash") for t in arr if isinstance(t, dict) and t.get("hash")}
+
+    async def torrent_source(self, torrent_hash):
+        async with httpx.AsyncClient(timeout=30) as c:
+            await self._login(c)
+            info_r = await c.get(f"{settings.QB_URL}/api/v2/torrents/info", params={"hashes": torrent_hash})
+            try:
+                arr = info_r.json()
+            except ValueError:
+                arr = []
+            info = arr[0] if isinstance(arr, list) and arr else {}
+            save_path = (info.get("save_path") or "").rstrip("/")
+            if not save_path:
+                raise HTTPException(status_code=404, detail="Torrent save path not found")
+            files_r = await c.get(f"{settings.QB_URL}/api/v2/torrents/files", params={"hash": torrent_hash})
+            try:
+                files = files_r.json()
+            except ValueError:
+                files = []
+            if not files:
+                raise HTTPException(status_code=404, detail="No files found for torrent")
+            names = [(f.get("name") or "").lstrip("/") for f in files if isinstance(f, dict) and f.get("name")]
+            return names, save_path
+
+
+def get_torrent_client() -> TorrentClient:
+    if settings.TORRENT_CLIENT == "qbittorrent":
+        return QbittorrentClient()
+    return TransmissionClient()
 
 # ---------------------------- Perform Import ----------------------------
 
 def sanitize(name: str) -> str:
     s = name.strip().replace(":", " -").replace("\\", "﹨").replace("/", "﹨")
-    return re.sub(r"\s+", " ", s)[:200] or "Unknown"
+    s = re.sub(r"\s+", " ", s)[:200]
+    if s in (".", ".."):
+        return "Unknown"
+    return s or "Unknown"
 
 def next_available(path: Path) -> Path:
     if not path.exists():
@@ -683,9 +869,57 @@ def mark_history_imported(history_id: int | None, torrent_hash: str):
                 WHERE torrent_hash = :torrent_hash
             """), {"ts": ts, "torrent_hash": torrent_hash})
 
+_notification_tasks: set = set()
+
+
+async def send_failure_notification(message: str) -> None:
+    """POST a plain-text failure message to the configured webhook.
+
+    Never raises: a notification problem must not affect an import.
+    """
+    url = settings.NOTIFY_WEBHOOK_URL
+    if not url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=settings.NOTIFY_TIMEOUT) as client:
+            await client.post(
+                url,
+                content=message.encode("utf-8"),
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+            )
+    except Exception:
+        logger.warning("Could not deliver failure notification", exc_info=True)
+
+
+def schedule_failure_notification(message: str) -> None:
+    """Fire-and-forget the notification from synchronous code.
+
+    No-ops when notifications are unconfigured or no event loop is running
+    (e.g. under pytest), so callers never need to care.
+    """
+    if not settings.NOTIFY_WEBHOOK_URL:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(send_failure_notification(message))
+    # Hold a reference: bare tasks can be garbage-collected before they finish.
+    _notification_tasks.add(task)
+    task.add_done_callback(_notification_tasks.discard)
+
+
+def format_failure_message(row, detail: str | None) -> str:
+    title = ((row or {}).get("title") or "").strip() or "Unknown title"
+    author = ((row or {}).get("author") or "").strip()
+    label = f"{title} by {author}" if author else title
+    return f"Import failed: {label}\n{detail or 'No detail recorded.'}"
+
+
 def mark_history_failed(history_id: int | None, torrent_hash: str, detail: str):
+    cleaned = clean_status_detail(detail)
     with engine.begin() as cx:
-        params = {"detail": clean_status_detail(detail)}
+        params = {"detail": cleaned}
         if history_id is not None:
             params["id"] = history_id
             cx.execute(text("""
@@ -696,6 +930,9 @@ def mark_history_failed(history_id: int | None, torrent_hash: str, detail: str):
                     status_updated_at = :ts
                 WHERE id = :id
             """), {"ts": utcnow_str(), **params})
+            row = cx.execute(text(
+                "SELECT title, author FROM history WHERE id = :id"
+            ), {"id": history_id}).mappings().first()
         else:
             params["torrent_hash"] = torrent_hash
             cx.execute(text("""
@@ -706,6 +943,11 @@ def mark_history_failed(history_id: int | None, torrent_hash: str, detail: str):
                     status_updated_at = :ts
                 WHERE torrent_hash = :torrent_hash
             """), {"ts": utcnow_str(), **params})
+            row = cx.execute(text(
+                "SELECT title, author FROM history WHERE torrent_hash = :torrent_hash"
+            ), {"torrent_hash": torrent_hash}).mappings().first()
+
+    schedule_failure_notification(format_failure_message(row, cleaned))
 
 def get_auto_import_candidates(completed_hashes: set[str]) -> list[dict]:
     if not completed_hashes:
@@ -753,25 +995,29 @@ def is_transient_auto_import_error(exc: HTTPException) -> bool:
     detail = str(exc.detail)
     return exc.status_code == 502 and detail.startswith("Transmission")
 
+def safe_child_path(root: Path, name: str) -> Path:
+    """Join `name` onto `root` and confirm the result stays within `root`.
+
+    Rejects absolute names and any that traverse outside `root` via '..'.
+    Raises HTTPException(400) on violation.
+    """
+    if os.path.isabs(name) or ".." in Path(name).parts:
+        raise HTTPException(status_code=400, detail=f"Unsafe path in torrent contents: {name!r}")
+    candidate = root / name
+    root_resolved = root.resolve()
+    candidate_resolved = candidate.resolve()
+    if root_resolved != candidate_resolved and root_resolved not in candidate_resolved.parents:
+        raise HTTPException(status_code=400, detail=f"Unsafe path in torrent contents: {name!r}")
+    return candidate
+
 async def import_torrent_to_library(author: str, title: str, h: str, media_type: str = MEDIA_TYPE_AUDIOBOOK, send_to_kindle: bool = True) -> str:
     media_type = normalize_media_type(media_type)
     author = sanitize(author)
     title = sanitize(title)
-    # Query Transmission for files and download directory.
-    async with httpx.AsyncClient(timeout=30) as c:
-        args = await transmission_rpc(c, "torrent-get", {
-            "ids": [h],
-            "fields": ["id", "hashString", "name", "downloadDir", "labels", "files"],
-        })
-        torrents = args.get("torrents") or []
-        info = torrents[0] if torrents else {}
-        files = info.get("files") or []
-        if not files:
-            raise HTTPException(status_code=404, detail="No files found for torrent")
-
-        download_dir = (info.get("downloadDir") or "").rstrip("/")
-        if not download_dir:
-            raise HTTPException(status_code=404, detail="Torrent download directory not found")
+    # Query the configured torrent client for files and source directory.
+    names, download_dir = await get_torrent_client().torrent_source(h)
+    if not names:
+        raise HTTPException(status_code=404, detail="No files found for torrent")
 
     source_dir = Path(validate_download_path(download_dir))
 
@@ -780,11 +1026,10 @@ async def import_torrent_to_library(author: str, title: str, h: str, media_type:
         lib = Path(settings.EBOOKS_DIR if send_to_kindle else settings.EBOOKS_NOSEND_DIR)
     else:
         lib = Path(settings.LIBRARY_DIR)
-    author_dir = lib / author
+    author_dir = safe_child_path(lib, author)
     author_dir.mkdir(parents=True, exist_ok=True)
-    dest_dir = next_available(author_dir / title)
+    dest_dir = next_available(safe_child_path(author_dir, title))
 
-    names = [(f.get("name") or "").lstrip("/") for f in files if f.get("name")]
     roots = {name.split("/", 1)[0] for name in names if "/" in name}
     common_root = next(iter(roots)) if len(roots) == 1 and all(name == next(iter(roots)) or name.startswith(next(iter(roots)) + "/") for name in names) else ""
 
@@ -794,14 +1039,14 @@ async def import_torrent_to_library(author: str, title: str, h: str, media_type:
     imported = 0
     try:
         if len(names) == 1:
-            src = source_dir / names[0]
+            src = safe_child_path(source_dir, names[0])
             if src.suffix.lower() == ".cue":
                 raise HTTPException(status_code=400, detail="Only .cue file found; nothing to import")
-            import_one(src, dest_dir / src.name)
+            import_one(src, safe_child_path(dest_dir, src.name))
             imported += 1
         else:
             for name in names:
-                src = source_dir / name
+                src = safe_child_path(source_dir, name)
                 if src.suffix.lower() == ".cue":
                     continue
                 rel_name = name
@@ -809,7 +1054,7 @@ async def import_torrent_to_library(author: str, title: str, h: str, media_type:
                     rel_name = name[len(common_root) + 1:]
                 if not rel_name:
                     continue
-                import_one(src, dest_dir / rel_name)
+                import_one(src, safe_child_path(dest_dir, rel_name))
                 imported += 1
     except Exception:
         if dest_dir.exists():
@@ -822,8 +1067,7 @@ async def import_torrent_to_library(author: str, title: str, h: str, media_type:
     return str(dest_dir)
 
 async def auto_import_cycle():
-    completed = await list_completed_torrents()
-    completed_hashes = {item.get("hash") for item in completed if item.get("hash")}
+    completed_hashes = await get_torrent_client().completed_hashes()
     for row in get_auto_import_candidates(completed_hashes):
         history_id = row["id"]
         torrent_hash = (row.get("torrent_hash") or "").strip()
@@ -896,10 +1140,3 @@ async def reconcile_auto_import_task():
         app.state.auto_import_stop = stop_event
         app.state.auto_import_task = asyncio.create_task(auto_import_loop(stop_event))
 
-@app.on_event("startup")
-async def startup_event():
-    await reconcile_auto_import_task()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await stop_auto_import_task()

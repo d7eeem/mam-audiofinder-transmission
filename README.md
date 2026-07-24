@@ -14,8 +14,8 @@ Lightweight web app and API for searching MyAnonamouse, sending downloads to Tra
 - Add torrents to Transmission with a dedicated label
 - Track download history
 - Auto-import completed audiobooks into `/library` using hardlinks
-- Auto-import completed ebooks into `/ebooks` using copies
-- Optionally import ebooks into `/ebooks-nosend` when `Send to Kindle` is unchecked
+- Auto-import completed ebooks into `/ebooks-nosend` (default) or `/ebooks` (when `Send to Kindle` is checked) using copies
+- Import ebooks into `/ebooks-nosend` by default; check `Send to Kindle` before adding to import into `/ebooks` instead
 
 ## Requirements
 
@@ -54,14 +54,27 @@ Runtime config comes from environment variables in `docker-compose.yml`.
 | `TRANSMISSION_URL` | Transmission RPC URL |
 | `TRANSMISSION_USER` | Transmission RPC username |
 | `TRANSMISSION_PASS` | Transmission RPC password |
+| `TORRENT_CLIENT` | Download client: `transmission` (default) or `qbittorrent` |
+| `QB_URL` | qBittorrent Web UI URL (used when `TORRENT_CLIENT=qbittorrent`) |
+| `QB_USER` | qBittorrent Web UI username |
+| `QB_PASS` | qBittorrent Web UI password |
+| `QB_CATEGORY` | qBittorrent category applied to adds and used to find completed downloads (default `mam-audiofinder`) |
+| `QB_TAGS` | Extra comma-separated qBittorrent tags applied to adds, in addition to the `mamid=` tag |
+| `FL_WEDGE_MIN_RESERVE` | Keep this many freeleech wedges unspent (0 = spend freely) |
+| `NOTIFY_WEBHOOK_URL` | Optional webhook for import-failure notifications (empty = disabled) |
 
+### Download client
+
+`TORRENT_CLIENT` selects which download client the app talks to: `transmission` (default) or `qbittorrent`. When set to `qbittorrent`, set `QB_URL`, `QB_USER`, and `QB_PASS`, and optionally `QB_CATEGORY` (default `mam-audiofinder`) and `QB_TAGS`. qBittorrent's completed downloads must be visible at `/downloads` inside the app container — the same shared-mount requirement as Transmission — and downloads and the audiobook library must share one filesystem for hardlinks to work.
 
 ## Notes
 
 - Search, add, and history are available from the main UI.
-- The `Send to Kindle` ebook toggle defaults on. When unchecked, new ebook adds are tagged `kindle-nosend` in Transmission and imported into `/ebooks-nosend`.
+- The `Send to Kindle` ebook toggle defaults **off**: new ebook adds are tagged `kindle-nosend` in Transmission and imported into `/ebooks-nosend`. Check `Send to Kindle` before adding to send the ebook to Kindle and import it into `/ebooks` instead.
 - Failed imports show `Failure` in history and can be retried with the row's `Retry` button after fixing the underlying path, mount, or permission issue.
 - The app has no authentication, so do not expose it directly to the public internet.
+- Freeleech wedges are spent automatically on audiobook adds. Set `FL_WEDGE_MIN_RESERVE` to keep a reserve — with `5`, the app stops using wedges once your balance reaches 5 and adds normally instead. The default `0` spends whenever any are available.
+- Set `NOTIFY_WEBHOOK_URL` to receive a plain-text message whenever an import fails — for example an [ntfy](https://ntfy.sh) topic URL. Leave it empty to disable notifications. Delivery is best-effort: a webhook that is down is logged and ignored, never retried, and never affects the import itself.
 
 ## License
 
