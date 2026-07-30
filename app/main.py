@@ -1,4 +1,5 @@
 import os, json, re, base64, asyncio, logging, errno
+import sys
 from pathlib import Path
 import shutil
 import httpx
@@ -8,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
@@ -142,6 +144,43 @@ engine = create_engine(HISTORY_DB_URL, future=True)
 def utcnow_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+def db_dir_writable(db_url: str) -> str | None:
+    """Return an error message if the SQLite DB's directory is missing or not
+    writable, else None. Non-file URLs (e.g. :memory:) return None."""
+    try:
+        path = make_url(db_url).database
+    except Exception:
+        return None
+    if not path or path == ":memory:":
+        return None
+    directory = os.path.dirname(path) or "."
+    if not os.path.isdir(directory):
+        return f"database directory {directory!r} does not exist — mount it and make it writable"
+    if not os.access(directory, os.W_OK):
+        return (f"database directory {directory!r} is not writable by uid {os.getuid()} "
+                f"— chown it to the container's user")
+    return None
+
+def hardlink_fs_warning(downloads: str, library: str) -> str | None:
+    """Return a warning if downloads and library exist on different filesystems
+    (audiobook imports hardlink between them and would fail with EXDEV), else None."""
+    try:
+        if os.path.isdir(downloads) and os.path.isdir(library):
+            if os.stat(downloads).st_dev != os.stat(library).st_dev:
+                return (f"{downloads!r} and {library!r} are on different filesystems; "
+                        f"audiobook imports hardlink between them and will fail (EXDEV) — "
+                        f"put both on one filesystem")
+    except OSError:
+        return None
+    return None
+
+def run_startup_preflight() -> None:
+    """Fatal, actionable checks that must pass before the DB is touched."""
+    err = db_dir_writable(HISTORY_DB_URL)
+    if err:
+        print(f"[preflight] FATAL: {err}", file=sys.stderr)
+        raise SystemExit(1)
+
 def ensure_history_schema() -> None:
     with engine.begin() as cx:
         cx.execute(text("""
@@ -168,6 +207,10 @@ def ensure_history_schema() -> None:
             cx.execute(text("ALTER TABLE history ADD COLUMN media_type TEXT"))
         if "send_to_kindle" not in cols:
             cx.execute(text("ALTER TABLE history ADD COLUMN send_to_kindle INTEGER DEFAULT 1"))
+        if "torrent_status" not in cols:
+            cx.execute(text("ALTER TABLE history ADD COLUMN torrent_status TEXT"))
+        if "torrent_hash" not in cols:
+            cx.execute(text("ALTER TABLE history ADD COLUMN torrent_hash TEXT"))
         cx.execute(text("""
             UPDATE history
             SET media_type = 'audiobook'
@@ -198,7 +241,14 @@ def ensure_history_schema() -> None:
                 status_updated_at = datetime('now')
             WHERE torrent_status = 'importing'
         """))
+        # Migration ledger. The block above is idempotent (CREATE IF NOT EXISTS +
+        # guarded ALTERs), so it is safe to run on every boot; user_version exists
+        # so a FUTURE, non-idempotent migration can be gated, e.g.:
+        #   if cx.exec_driver_sql("PRAGMA user_version").scalar() < 2:
+        #       cx.exec_driver_sql("<revision-2 migration>")
+        cx.exec_driver_sql("PRAGMA user_version = 1")
 
+run_startup_preflight()
 ensure_history_schema()
 
 def mam_headers(*, torrent: bool = False) -> dict:
@@ -240,6 +290,13 @@ async def fetch_freeleech_wedge_count(client: httpx.AsyncClient) -> int | None:
 # ---------------------------- App ----------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    warn = hardlink_fs_warning(settings.DOWNLOADS_DIR, settings.LIBRARY_DIR)
+    if warn:
+        print(f"[preflight] WARNING: {warn}", file=sys.stderr)
+    for d in (settings.LIBRARY_DIR, settings.EBOOKS_DIR, settings.EBOOKS_NOSEND_DIR):
+        if not os.path.isdir(d):
+            print(f"[preflight] WARNING: library directory {d!r} does not exist yet "
+                  f"— imports there will fail until it is mounted/created", file=sys.stderr)
     await reconcile_auto_import_task()
     try:
         yield
