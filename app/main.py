@@ -98,8 +98,12 @@ class Settings:
     def __init__(self) -> None:
         self.MAM_BASE = DEFAULT_MAM_BASE
         self.MAM_COOKIE = build_mam_cookie(os.getenv("MAM_COOKIE", ""))
-        if not self.MAM_COOKIE:
-            raise RuntimeError("MAM_COOKIE environment variable is required and must be set to a non-empty value")
+        self.MAM_ID_FILE = os.getenv("MAM_ID_FILE", "").strip()
+        if not self.MAM_COOKIE and not self.MAM_ID_FILE:
+            raise RuntimeError(
+                "Set MAM_COOKIE (a MAM session cookie) or MAM_ID_FILE (path to a "
+                "file containing the current mam_id, e.g. written by mamapi)"
+            )
         self.TRANSMISSION_URL = os.getenv("TRANSMISSION_URL", "http://transmission:9091/transmission/rpc").rstrip("/")
         self.TRANSMISSION_USER = os.getenv("TRANSMISSION_USER", "")
         self.TRANSMISSION_PASS = os.getenv("TRANSMISSION_PASS", "")
@@ -251,9 +255,23 @@ def ensure_history_schema() -> None:
 run_startup_preflight()
 ensure_history_schema()
 
+def current_mam_cookie() -> str:
+    """The MAM cookie for outgoing requests. If MAM_ID_FILE is set and readable,
+    its contents (normalized via build_mam_cookie) are used, so an external
+    updater like mamapi can refresh the session without restarting this app.
+    Falls back to the static MAM_COOKIE."""
+    if settings.MAM_ID_FILE:
+        try:
+            raw = Path(settings.MAM_ID_FILE).read_text().strip()
+        except OSError:
+            raw = ""
+        if raw:
+            return build_mam_cookie(raw)
+    return settings.MAM_COOKIE
+
 def mam_headers(*, torrent: bool = False) -> dict:
     headers = {
-        "Cookie": settings.MAM_COOKIE,
+        "Cookie": current_mam_cookie(),
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://www.myanonamouse.net/",
         "Origin": "https://www.myanonamouse.net",
@@ -288,6 +306,17 @@ async def fetch_freeleech_wedge_count(client: httpx.AsyncClient) -> int | None:
     return value if value >= 0 else None
 
 # ---------------------------- App ----------------------------
+async def torrent_client_warning() -> str | None:
+    """Return a warning if the configured torrent client is unreachable at
+    startup, else None. Never raises."""
+    try:
+        await get_torrent_client().reachable()
+        return None
+    except Exception as exc:
+        return (f"{settings.TORRENT_CLIENT} is not reachable at startup ({exc!s}) "
+                f"— check its URL and credentials; torrent adds and imports will "
+                f"fail until it is up")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     warn = hardlink_fs_warning(settings.DOWNLOADS_DIR, settings.LIBRARY_DIR)
@@ -297,6 +326,9 @@ async def lifespan(app: FastAPI):
         if not os.path.isdir(d):
             print(f"[preflight] WARNING: library directory {d!r} does not exist yet "
                   f"— imports there will fail until it is mounted/created", file=sys.stderr)
+    client_warn = await torrent_client_warning()
+    if client_warn:
+        print(f"[preflight] WARNING: {client_warn}", file=sys.stderr)
     await reconcile_auto_import_task()
     try:
         yield
@@ -337,7 +369,7 @@ async def search(payload: dict):
     body = {"tor": tor, "perpage": perpage}
 
     headers = {
-        "Cookie": settings.MAM_COOKIE,
+        "Cookie": current_mam_cookie(),
         "Content-Type": "application/json",
         "Accept": "application/json, */*",
         "User-Agent": "Mozilla/5.0",
@@ -706,6 +738,10 @@ class TorrentClient:
         """Return (relative file names, source directory) for a completed torrent."""
         raise NotImplementedError
 
+    async def reachable(self) -> None:
+        """Raise if the client is unreachable / misconfigured; return None if OK."""
+        raise NotImplementedError
+
 
 class TransmissionClient(TorrentClient):
     async def add_torrent(self, metainfo, mam_id, media_type, send_to_kindle):
@@ -737,6 +773,10 @@ class TransmissionClient(TorrentClient):
                 raise HTTPException(status_code=404, detail="Torrent download directory not found")
             names = [(f.get("name") or "").lstrip("/") for f in files if f.get("name")]
             return names, download_dir
+
+    async def reachable(self):
+        async with httpx.AsyncClient(timeout=5) as c:
+            await transmission_rpc(c, "session-get")
 
 
 class QbittorrentClient(TorrentClient):
@@ -821,6 +861,10 @@ class QbittorrentClient(TorrentClient):
                 raise HTTPException(status_code=404, detail="No files found for torrent")
             names = [(f.get("name") or "").lstrip("/") for f in files if isinstance(f, dict) and f.get("name")]
             return names, save_path
+
+    async def reachable(self):
+        async with httpx.AsyncClient(timeout=5) as c:
+            await self._login(c)
 
 
 def get_torrent_client() -> TorrentClient:
